@@ -14,6 +14,7 @@ credentials.txt
 config.ini
 sharepoint_sites.csv
 sharepoint_sites_all.csv
+o365_token.txt
 
 # Keep the templates
 !credentials.txt.template
@@ -28,6 +29,7 @@ logs/
 *.db
 *.db-journal
 *.db-wal
+*.db-shm
 db_backups/
 
 # Downloads
