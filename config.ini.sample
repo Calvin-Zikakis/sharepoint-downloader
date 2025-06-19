@@ -1,17 +1,25 @@
 [sharepoint_backup]
-# Output directory for downloaded files
+# Output directory for downloaded files (use forward slashes or double backslashes on Windows)
+# For paths with spaces, you can use quotes or just include the spaces directly
+# Examples: 
+#   Windows: "C:/My SharePoint Backup" or C:/My SharePoint Backup or ./sharepoint backup
+#   Linux/Mac: "./sharepoint backup" or /home/user/my sharepoint backup
 OUTPUT_DIR = ./sharepoint_backup
 
 # Path to CSV file containing SharePoint sites
+# Example with spaces: "./my sharepoint sites.csv"
 CSV_PATH = ./sharepoint_sites.csv
 
 # Path to credentials file
+# Example with spaces: "./my credentials.txt"
 CREDENTIALS_PATH = ./credentials.txt
 
 # Directory for log files
+# Example with spaces: "./my logs" or "C:/Program Files/SharePoint Logs"
 LOG_DIR = ./logs
 
 # SQLite database path
+# Example with spaces: "./my progress.db"
 DB_PATH = ./progress.db
 
 # Number of concurrent download threads

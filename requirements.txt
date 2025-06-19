@@ -1,0 +1,3 @@
+# SharePoint Backup Tool Requirements
+O365>=2.0.0
+setuptools>=40.0.0
