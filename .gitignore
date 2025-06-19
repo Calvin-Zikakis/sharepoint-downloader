@@ -13,6 +13,7 @@ ENV/
 credentials.txt
 config.ini
 sharepoint_sites.csv
+sharepoint_sites_all.csv
 
 # Keep the templates
 !credentials.txt.template
