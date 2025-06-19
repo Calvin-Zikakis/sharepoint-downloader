@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Credentials and Configuration
+credentials.txt
+config.ini
+sharepoint_sites.csv
+
+# Keep the templates
+!credentials.txt.template
+!config.ini.sample
+!sharepoint_sites.csv.sample
+
+# Logs
+logs/
+*.log
+
+# Database
+*.db
+*.db-journal
+*.db-wal
+db_backups/
+
+# Downloads
+sharepoint_backup/
+downloads/
+backup/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Distribution
+dist/
+build/
+*.egg-info/

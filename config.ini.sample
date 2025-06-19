@@ -1,0 +1,45 @@
+[sharepoint_backup]
+# Output directory for downloaded files
+OUTPUT_DIR = ./sharepoint_backup
+
+# Path to CSV file containing SharePoint sites
+CSV_PATH = ./sharepoint_sites.csv
+
+# Path to credentials file
+CREDENTIALS_PATH = ./credentials.txt
+
+# Directory for log files
+LOG_DIR = ./logs
+
+# SQLite database path
+DB_PATH = ./progress.db
+
+# Number of concurrent download threads
+NUM_THREADS = 5
+
+# Maximum retry attempts for failed downloads
+MAX_RETRY = 3
+
+# Batch size for processing files
+BATCH_SIZE = 1000
+
+# Maximum files to process before re-authenticating
+MAX_FILES_PER_SESSION = 5000
+
+# Delay in seconds when API errors occur
+API_RETRY_DELAY = 30
+
+# Token refresh interval in seconds (45 minutes)
+TOKEN_REFRESH_INTERVAL = 2700
+
+# Progress save interval in seconds
+PROGRESS_SAVE_INTERVAL = 300
+
+# Database backup interval in seconds
+DB_BACKUP_INTERVAL = 600
+
+# Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+LOG_LEVEL = INFO
+
+# Enable debug mode
+DEBUG_MODE = False
