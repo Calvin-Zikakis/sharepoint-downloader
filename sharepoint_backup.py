@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SharePoint Backup / Downlaoder Tool
+SharePoint Backup / Downloader Tool
 A robust tool for backing up SharePoint sites to local storage with SQLite progress tracking.
 
 Repository: https://github.com/Calvin-Zikakis/sharepoint-downloader
@@ -259,10 +259,27 @@ def init_database():
             )
         ''')
         
+        # Sites tracking table
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS sites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                site_name TEXT UNIQUE NOT NULL,
+                site_url TEXT,
+                status TEXT DEFAULT 'pending',
+                total_files INTEGER DEFAULT 0,
+                completed_files INTEGER DEFAULT 0,
+                failed_files INTEGER DEFAULT 0,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
         # Create indexes for better query performance
         conn.execute('CREATE INDEX IF NOT EXISTS idx_status ON downloads(status)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_site ON downloads(site_name)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_library ON downloads(library_name)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_site_status ON sites(status)')
         
         # Statistics table
         conn.execute('''
@@ -339,6 +356,134 @@ def update_session(session_id, **kwargs):
         query = f"UPDATE sessions SET {', '.join(set_clauses)} WHERE id = ?"
         conn.execute(query, values)
 
+def get_site_status(site_name):
+    """Get the status of a site and check if it needs processing"""
+    with get_db() as conn:
+        # Check if site exists in database
+        site_info = conn.execute('''
+            SELECT status, total_files, completed_files, failed_files 
+            FROM sites 
+            WHERE site_name = ?
+        ''', (site_name,)).fetchone()
+        
+        if not site_info:
+            return 'new', True  # New site, needs processing
+        
+        # Get actual counts from downloads table
+        counts = conn.execute('''
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+                SUM(CASE WHEN status = 'discovered' THEN 1 ELSE 0 END) as discovered,
+                SUM(CASE WHEN status = 'downloading' THEN 1 ELSE 0 END) as downloading
+            FROM downloads 
+            WHERE site_name = ?
+        ''', (site_name,)).fetchone()
+        
+        # Update site record with actual counts
+        conn.execute('''
+            UPDATE sites 
+            SET total_files = ?, completed_files = ?, failed_files = ?, last_updated = CURRENT_TIMESTAMP
+            WHERE site_name = ?
+        ''', (counts['total'], counts['completed'], counts['failed'], site_name))
+        
+        # Determine if site needs processing
+        if counts['total'] == 0:
+            # No files found yet, needs processing
+            return 'pending', True
+        elif counts['failed'] > 0:
+            # Has failed files, needs retry
+            logger.info(f"Site '{site_name}' has {counts['failed']} failed files that need retry")
+            return 'partial', True
+        elif counts['discovered'] > 0 or counts['downloading'] > 0:
+            # Has unprocessed files
+            logger.info(f"Site '{site_name}' has {counts['discovered']} discovered and {counts['downloading']} downloading files")
+            return 'in_progress', True
+        elif counts['completed'] == counts['total'] and counts['total'] > 0:
+            # All files completed successfully
+            logger.info(f"Site '{site_name}' is complete with {counts['completed']} files")
+            return 'completed', False
+        else:
+            # Default to processing
+            return 'pending', True
+
+def mark_site_started(site_name, site_url):
+    """Mark a site as started processing"""
+    with get_db() as conn:
+        conn.execute('''
+            INSERT OR REPLACE INTO sites (site_name, site_url, status, started_at, last_updated)
+            VALUES (?, ?, 'processing', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ''', (site_name, site_url))
+
+def update_site_status(site_name):
+    """Update site status based on file completion"""
+    with get_db() as conn:
+        # Get current file counts
+        counts = conn.execute('''
+            SELECT 
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
+            FROM downloads 
+            WHERE site_name = ?
+        ''', (site_name,)).fetchone()
+        
+        # Determine site status
+        if counts['total'] == 0:
+            status = 'empty'
+        elif counts['completed'] == counts['total']:
+            status = 'completed'
+        elif counts['failed'] > 0 and counts['completed'] + counts['failed'] == counts['total']:
+            status = 'completed_with_errors'
+        else:
+            status = 'processing'
+        
+        # Update site record
+        if status in ['completed', 'completed_with_errors']:
+            conn.execute('''
+                UPDATE sites 
+                SET status = ?, total_files = ?, completed_files = ?, failed_files = ?, 
+                    completed_at = CURRENT_TIMESTAMP, last_updated = CURRENT_TIMESTAMP
+                WHERE site_name = ?
+            ''', (status, counts['total'], counts['completed'], counts['failed'], site_name))
+        else:
+            conn.execute('''
+                UPDATE sites 
+                SET status = ?, total_files = ?, completed_files = ?, failed_files = ?, 
+                    last_updated = CURRENT_TIMESTAMP
+                WHERE site_name = ?
+            ''', (status, counts['total'], counts['completed'], counts['failed'], site_name))
+        
+        logger.info(f"Site '{site_name}' status: {status} (Total: {counts['total']}, Completed: {counts['completed']}, Failed: {counts['failed']})")
+        
+        return status
+
+def should_retry_failed_files(site_name):
+    """Check if site has failed files that should be retried"""
+    with get_db() as conn:
+        failed_files = conn.execute('''
+            SELECT file_path, attempt_count, error_message 
+            FROM downloads 
+            WHERE site_name = ? 
+                AND status = 'failed' 
+                AND attempt_count < ?
+        ''', (site_name, config['MAX_RETRY'])).fetchall()
+        
+        if failed_files:
+            logger.info(f"Found {len(failed_files)} failed files to retry in site '{site_name}'")
+            # Reset status for retry
+            for file in failed_files:
+                conn.execute('''
+                    UPDATE downloads 
+                    SET status = 'discovered' 
+                    WHERE file_path = ?
+                ''', (file['file_path'],))
+            
+            return True, failed_files
+        
+        return False, []
+
 def get_file_status(file_path):
     """Check if a file has been downloaded or is in progress"""
     with get_db() as conn:
@@ -351,134 +496,16 @@ def get_file_status(file_path):
             return result['status'], result['attempt_count']
         return None, 0
 
-def update_statistics(stat_name, increment=1):
-    """Update a statistic by incrementing its value"""
-    with get_db() as conn:
-        conn.execute('''
-            UPDATE statistics 
-            SET stat_value = stat_value + ?, last_updated = CURRENT_TIMESTAMP 
-            WHERE stat_name = ?
-        ''', (increment, stat_name))
-
 def record_file_discovery(file_path, site_name, library_name, file_name, file_size_bytes=None):
     """Record when a file is discovered"""
     file_size_mb = bytes_to_mb(file_size_bytes) if file_size_bytes else None
     
     with get_db() as conn:
-        # Check if this is a new file
-        existing = conn.execute(
-            'SELECT COUNT(*) FROM downloads WHERE file_path = ?',
-            (file_path,)
-        ).fetchone()[0]
-        
-        if existing == 0:
-            conn.execute('''
-                INSERT INTO downloads 
-                (file_path, site_name, library_name, file_name, file_size_mb, status, attempt_count, created_at)
-                VALUES (?, ?, ?, ?, ?, 'discovered', 0, CURRENT_TIMESTAMP)
-            ''', (file_path, site_name, library_name, file_name, file_size_mb))
-            
-            # Update total_files count
-            update_statistics('total_files')
-
-def download_file(file_item, local_path, site_name, library_name):
-    """Download a single file from SharePoint with improved error handling"""
-    global file_counter
-    
-    # Increment file counter and check if we need to refresh token
-    with file_counter_lock:
-        file_counter += 1
-        if file_counter % 100 == 0:
-            refresh_token_if_needed()
-            backup_database()
-    
-    try:
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        
-        # Check if file already exists and compare size
-        if os.path.exists(local_path):
-            local_size = os.path.getsize(local_path)
-            try:
-                remote_size = file_item.size if hasattr(file_item, 'size') else None
-                if remote_size and local_size == remote_size:
-                    update_download_status(local_path, 'completed', file_size_bytes=local_size)
-                    # Update skipped_existing counter
-                    update_statistics('skipped_existing')
-                    logger.debug(f"File already exists with same size: {local_path}")
-                    return True
-            except Exception as e:
-                logger.debug(f"Could not compare file sizes: {e}")
-        
-        # Update status from 'discovered' to 'downloading'
-        with get_db() as conn:
-            conn.execute('''
-                UPDATE downloads 
-                SET status = 'downloading', 
-                    attempt_count = attempt_count + 1,
-                    last_attempt = CURRENT_TIMESTAMP
-                WHERE file_path = ?
-            ''', (local_path,))
-        
-        # Download the file with retry logic
-        for attempt in range(config['MAX_RETRY']):
-            try:
-                # Try to download
-                response = file_item.download(to_path=os.path.dirname(local_path), name=os.path.basename(local_path))
-                
-                if response:
-                    # Get actual file size after download
-                    actual_size = os.path.getsize(local_path) if os.path.exists(local_path) else None
-                    update_download_status(local_path, 'completed', file_size_bytes=actual_size)
-                    
-                    stats = get_statistics()
-                    size_mb = bytes_to_mb(actual_size) if actual_size else 0
-                    logger.info(f"Downloaded file ({stats['successful_downloads']}): {local_path} ({size_mb:.2f} MB)")
-                    return True
-                else:
-                    logger.warning(f"Failed to download file (attempt {attempt+1}/{config['MAX_RETRY']}): {local_path}")
-                    # Update api_errors counter
-                    update_statistics('api_errors')
-                    if attempt < config['MAX_RETRY'] - 1:
-                        time.sleep(config['API_RETRY_DELAY'] * (attempt + 1))
-                        
-            except IndexError as e:
-                error_msg = f"IndexError: {str(e)}"
-                logger.error(f"IndexError downloading file (attempt {attempt+1}/{config['MAX_RETRY']}): {local_path}")
-                # Update api_errors counter
-                update_statistics('api_errors')
-                
-                if attempt < config['MAX_RETRY'] - 1:
-                    logger.info(f"Waiting {config['API_RETRY_DELAY'] * (attempt + 1)} seconds before retry...")
-                    time.sleep(config['API_RETRY_DELAY'] * (attempt + 1))
-                    refresh_token_if_needed()
-                else:
-                    update_download_status(local_path, 'failed', error_msg)
-                    
-            except Exception as e:
-                error_msg = str(e)
-                logger.warning(f"Error downloading file (attempt {attempt+1}/{config['MAX_RETRY']}): {local_path}, Error: {error_msg}")
-                # Update api_errors counter for API-related errors
-                if any(keyword in error_msg.lower() for keyword in ['api', 'token', 'auth', 'timeout', 'connection']):
-                    update_statistics('api_errors')
-                    
-                if attempt < config['MAX_RETRY'] - 1:
-                    time.sleep(2 * (attempt + 1))
-                else:
-                    update_download_status(local_path, 'failed', error_msg)
-        
-        # All retries failed
-        final_error = f"Failed after {config['MAX_RETRY']} attempts"
-        update_download_status(local_path, 'failed', final_error)
-        failed_files_logger.error(f"{final_error}: {local_path}")
-        
-        return False
-        
-    except Exception as e:
-        error_msg = f"Unexpected error: {str(e)}"
-        update_download_status(local_path, 'failed', error_msg)
-        logger.error(f"Unexpected error downloading file {getattr(file_item, 'name', 'unknown')}: {str(e)}")
-        failed_files_logger.error(f"Unexpected error for {local_path}: {str(e)}")
-        return False
+        conn.execute('''
+            INSERT OR IGNORE INTO downloads 
+            (file_path, site_name, library_name, file_name, file_size_mb, status, attempt_count, created_at)
+            VALUES (?, ?, ?, ?, ?, 'discovered', 0, CURRENT_TIMESTAMP)
+        ''', (file_path, site_name, library_name, file_name, file_size_mb))
 
 def update_download_status(file_path, status, error_message=None, file_size_bytes=None):
     """Update the status of a download"""
@@ -494,10 +521,18 @@ def update_download_status(file_path, status, error_message=None, file_size_byte
             ''', (status, file_size_mb, file_path))
             
             # Update statistics
-            update_statistics('successful_downloads')
+            conn.execute('''
+                UPDATE statistics 
+                SET stat_value = stat_value + 1, last_updated = CURRENT_TIMESTAMP 
+                WHERE stat_name = 'successful_downloads'
+            ''')
             
             if file_size_mb:
-                update_statistics('mb_downloaded', file_size_mb)
+                conn.execute('''
+                    UPDATE statistics 
+                    SET stat_value = stat_value + ?, last_updated = CURRENT_TIMESTAMP 
+                    WHERE stat_name = 'mb_downloaded'
+                ''', (file_size_mb,))
                 
         elif status == 'failed':
             conn.execute('''
@@ -507,7 +542,11 @@ def update_download_status(file_path, status, error_message=None, file_size_byte
             ''', (status, error_message, file_path))
             
             # Update statistics
-            update_statistics('failed_downloads')
+            conn.execute('''
+                UPDATE statistics 
+                SET stat_value = stat_value + 1, last_updated = CURRENT_TIMESTAMP 
+                WHERE stat_name = 'failed_downloads'
+            ''')
 
 def get_statistics():
     """Get current statistics"""
@@ -676,8 +715,6 @@ def download_file(file_item, local_path, site_name, library_name):
                 remote_size = file_item.size if hasattr(file_item, 'size') else None
                 if remote_size and local_size == remote_size:
                     update_download_status(local_path, 'completed', file_size_bytes=local_size)
-                    # Update skipped_existing counter
-                    update_statistics('skipped_existing')
                     logger.debug(f"File already exists with same size: {local_path}")
                     return True
             except Exception as e:
@@ -710,16 +747,12 @@ def download_file(file_item, local_path, site_name, library_name):
                     return True
                 else:
                     logger.warning(f"Failed to download file (attempt {attempt+1}/{config['MAX_RETRY']}): {local_path}")
-                    # Update api_errors counter
-                    update_statistics('api_errors')
                     if attempt < config['MAX_RETRY'] - 1:
                         time.sleep(config['API_RETRY_DELAY'] * (attempt + 1))
                         
             except IndexError as e:
                 error_msg = f"IndexError: {str(e)}"
                 logger.error(f"IndexError downloading file (attempt {attempt+1}/{config['MAX_RETRY']}): {local_path}")
-                # Update api_errors counter
-                update_statistics('api_errors')
                 
                 if attempt < config['MAX_RETRY'] - 1:
                     logger.info(f"Waiting {config['API_RETRY_DELAY'] * (attempt + 1)} seconds before retry...")
@@ -731,10 +764,6 @@ def download_file(file_item, local_path, site_name, library_name):
             except Exception as e:
                 error_msg = str(e)
                 logger.warning(f"Error downloading file (attempt {attempt+1}/{config['MAX_RETRY']}): {local_path}, Error: {error_msg}")
-                # Update api_errors counter for API-related errors
-                if any(keyword in error_msg.lower() for keyword in ['api', 'token', 'auth', 'timeout', 'connection']):
-                    update_statistics('api_errors')
-                    
                 if attempt < config['MAX_RETRY'] - 1:
                     time.sleep(2 * (attempt + 1))
                 else:
@@ -870,11 +899,26 @@ def process_folder(folder, local_base_path, download_queue, site_name, library_n
         return False
 
 def backup_sharepoint_site(site_info, account, session_id):
-    """Backup a SharePoint site with improved error handling"""
+    """Backup a SharePoint site with improved error handling and site-level tracking"""
     site_name = site_info['name']
     original_site_url = site_info['url']
     
+    # Check if site needs processing
+    site_status, needs_processing = get_site_status(site_name)
+    
+    if not needs_processing:
+        logger.info(f"✓ Site '{site_name}' is already complete. Skipping.")
+        return True
+    
+    # Check for failed files that need retry
+    has_failed_files, failed_files = should_retry_failed_files(site_name)
+    if has_failed_files:
+        logger.info(f"Site '{site_name}' has {len(failed_files)} failed files to retry")
+    
     try:
+        # Mark site as started
+        mark_site_started(site_name, original_site_url)
+        
         # Parse the URL
         parsed_url = urlparse(original_site_url)
         hostname = parsed_url.hostname
@@ -917,17 +961,40 @@ def backup_sharepoint_site(site_info, account, session_id):
         
         if not document_libraries:
             logger.warning(f"No document libraries found for site: {site_name}")
-            return False
+            # Mark site as complete (empty)
+            update_site_status(site_name)
+            return True
         
         logger.info(f"Found {len(document_libraries)} document libraries in {site_name}")
+        
+        # Check which libraries need processing
+        libraries_to_process = []
+        for doc_lib in document_libraries:
+            # Check if library has any incomplete files
+            with get_db() as conn:
+                incomplete_count = conn.execute('''
+                    SELECT COUNT(*) as count
+                    FROM downloads 
+                    WHERE site_name = ? AND library_name = ? AND status != 'completed'
+                ''', (site_name, doc_lib.name)).fetchone()['count']
+                
+                if incomplete_count > 0 or site_status == 'new':
+                    libraries_to_process.append(doc_lib)
+                else:
+                    logger.info(f"✓ Library '{doc_lib.name}' is complete. Skipping.")
+        
+        if not libraries_to_process and not has_failed_files:
+            logger.info(f"✓ All libraries in site '{site_name}' are complete.")
+            update_site_status(site_name)
+            return True
         
         # Create download queue
         download_queue = queue.Queue(maxsize=config['BATCH_SIZE'] * 2)
         
-        # Process each document library
-        for lib_idx, doc_lib in enumerate(document_libraries):
+        # Process each document library that needs processing
+        for lib_idx, doc_lib in enumerate(libraries_to_process):
             try:
-                logger.info(f"\nProcessing document library {lib_idx+1}/{len(document_libraries)}: {doc_lib.name} in site: {site_name}")
+                logger.info(f"\nProcessing document library {lib_idx+1}/{len(libraries_to_process)}: {doc_lib.name} in site: {site_name}")
                 
                 # Create local folder for this document library
                 local_lib_path = os.path.join(local_site_path, doc_lib.name)
@@ -941,6 +1008,14 @@ def backup_sharepoint_site(site_info, account, session_id):
                     t.daemon = True
                     t.start()
                     threads.append(t)
+                
+                # If we have failed files, queue them first
+                if has_failed_files:
+                    failed_in_lib = [f for f in failed_files if f['file_path'].startswith(local_lib_path)]
+                    if failed_in_lib:
+                        logger.info(f"Queueing {len(failed_in_lib)} failed files for retry in {doc_lib.name}")
+                        # Note: We need to recreate the file_item objects for failed files
+                        # This is a limitation - we're marking them for discovery but not queueing them directly
                 
                 # Get root folder of the document library
                 logger.info(f"Scanning folders in {doc_lib.name}...")
@@ -990,8 +1065,8 @@ def backup_sharepoint_site(site_info, account, session_id):
                 while active_downloads and timeout_counter < max_timeout:
                     with get_db() as conn:
                         downloading_count = conn.execute(
-                            "SELECT COUNT(*) FROM downloads WHERE status='downloading' AND library_name=?",
-                            (doc_lib.name,)
+                            "SELECT COUNT(*) FROM downloads WHERE status='downloading' AND site_name=? AND library_name=?",
+                            (site_name, doc_lib.name)
                         ).fetchone()[0]
                     
                     if downloading_count == 0:
@@ -1019,11 +1094,22 @@ def backup_sharepoint_site(site_info, account, session_id):
                 logger.error(f"Error processing document library {doc_lib.name}: {str(e)}")
                 continue
         
-        logger.info(f"Completed backup of site: {site_name}")
-        return True
+        # Update final site status
+        final_status = update_site_status(site_name)
+        
+        if final_status == 'completed':
+            logger.info(f"✅ Successfully completed backup of site: {site_name}")
+            return True
+        elif final_status == 'completed_with_errors':
+            logger.warning(f"⚠️ Completed backup of site '{site_name}' with some errors")
+            return True
+        else:
+            logger.warning(f"⚠️ Partially completed backup of site: {site_name}")
+            return False
         
     except Exception as e:
         logger.error(f"Error backing up SharePoint site {site_name}: {str(e)}")
+        update_site_status(site_name)
         return False
 
 def verify_output_path():
@@ -1047,15 +1133,33 @@ def verify_output_path():
         return False
 
 def print_statistics():
-    """Print download statistics"""
+    """Print download statistics with site-level progress"""
     stats = get_statistics()
     
     logger.info("\n" + "="*50)
     logger.info("DOWNLOAD STATISTICS")
     logger.info("="*50)
     
-    # Get detailed status counts
+    # Get site-level statistics
     with get_db() as conn:
+        # Site summary
+        site_stats = conn.execute('''
+            SELECT 
+                COUNT(*) as total_sites,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_sites,
+                SUM(CASE WHEN status = 'completed_with_errors' THEN 1 ELSE 0 END) as sites_with_errors,
+                SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) as processing_sites
+            FROM sites
+        ''').fetchone()
+        
+        if site_stats and site_stats['total_sites'] > 0:
+            logger.info(f"\nSITE PROGRESS:")
+            logger.info(f"  Total sites: {site_stats['total_sites']}")
+            logger.info(f"  ✅ Completed: {site_stats['completed_sites']}")
+            logger.info(f"  ⚠️  With errors: {site_stats['sites_with_errors']}")
+            logger.info(f"  🔄 Processing: {site_stats['processing_sites']}")
+        
+        # File-level statistics
         status_counts = conn.execute('''
             SELECT status, COUNT(*) as count 
             FROM downloads 
@@ -1063,15 +1167,17 @@ def print_statistics():
             ORDER BY status
         ''').fetchall()
         
+        logger.info(f"\nFILE STATUS:")
         total_files = sum(row['count'] for row in status_counts)
-        logger.info(f"Total files tracked: {total_files}")
+        logger.info(f"  Total files tracked: {total_files}")
         
         for row in status_counts:
             logger.info(f"  {row['status']}: {row['count']}")
     
-    logger.info(f"\nSuccessful downloads: {stats.get('successful_downloads', 0)}")
-    logger.info(f"Failed downloads: {stats.get('failed_downloads', 0)}")
-    logger.info(f"Data downloaded: {format_size(stats.get('mb_downloaded', 0))}")
+    logger.info(f"\nDOWNLOAD METRICS:")
+    logger.info(f"  Successful downloads: {stats.get('successful_downloads', 0)}")
+    logger.info(f"  Failed downloads: {stats.get('failed_downloads', 0)}")
+    logger.info(f"  Data downloaded: {format_size(stats.get('mb_downloaded', 0))}")
     
     # Show current activity
     with get_db() as conn:
@@ -1082,59 +1188,49 @@ def print_statistics():
         ''').fetchone()
         
         if downloading and downloading['count'] > 0:
-            logger.info(f"\nCurrently downloading: {downloading['count']} files")
+            logger.info(f"\n⬇️  Currently downloading: {downloading['count']} files")
+            
+            # Show which site/library is active
+            active_downloads = conn.execute('''
+                SELECT site_name, library_name, COUNT(*) as count
+                FROM downloads 
+                WHERE status = 'downloading'
+                GROUP BY site_name, library_name
+                LIMIT 3
+            ''').fetchall()
+            
+            for dl in active_downloads:
+                logger.info(f"    {dl['site_name']}/{dl['library_name']}: {dl['count']} files")
     
-    # Get failed files for summary
+    # Get failed files summary by site
     with get_db() as conn:
-        failed_files = conn.execute('''
-            SELECT file_path, attempt_count, error_message 
+        failed_by_site = conn.execute('''
+            SELECT site_name, COUNT(*) as failed_count
             FROM downloads 
             WHERE status = 'failed' AND attempt_count >= ?
-            LIMIT 10
+            GROUP BY site_name
+            ORDER BY failed_count DESC
+            LIMIT 5
         ''', (config['MAX_RETRY'],)).fetchall()
         
-        if failed_files:
-            logger.info(f"\nFailed files (showing first 10):")
-            for file in failed_files:
-                logger.info(f"  - {file['file_path']}")
-                logger.info(f"    Attempts: {file['attempt_count']}, Error: {file['error_message']}")
+        if failed_by_site:
+            logger.info(f"\n❌ SITES WITH FAILED FILES:")
+            for site in failed_by_site:
+                logger.info(f"  {site['site_name']}: {site['failed_count']} failed files")
     
     logger.info("="*50 + "\n")
 
-def fix_statistics():
-    """Fix/recalculate statistics from existing data"""
-    with get_db() as conn:
-        # Recalculate total_files
-        total = conn.execute('SELECT COUNT(*) FROM downloads').fetchone()[0]
-        conn.execute('UPDATE statistics SET stat_value = ? WHERE stat_name = "total_files"', (total,))
-        
-        # Recalculate successful_downloads
-        successful = conn.execute('SELECT COUNT(*) FROM downloads WHERE status = "completed"').fetchone()[0]
-        conn.execute('UPDATE statistics SET stat_value = ? WHERE stat_name = "successful_downloads"', (successful,))
-        
-        # Recalculate failed_downloads
-        failed = conn.execute('SELECT COUNT(*) FROM downloads WHERE status = "failed"').fetchone()[0]
-        conn.execute('UPDATE statistics SET stat_value = ? WHERE stat_name = "failed_downloads"', (failed,))
-        
-        # Recalculate mb_downloaded
-        mb_total = conn.execute('SELECT COALESCE(SUM(file_size_mb), 0) FROM downloads WHERE status = "completed"').fetchone()[0]
-        conn.execute('UPDATE statistics SET stat_value = ? WHERE stat_name = "mb_downloaded"', (mb_total,))
-        
-        logger.info("Statistics recalculated from database")
-
 def main():
+    """Main function with SQLite-based progress tracking"""
+    global global_account
+    
     parser = argparse.ArgumentParser(description='SharePoint Backup Tool')
     parser.add_argument('--config', help='Path to config file', default='config.ini')
     parser.add_argument('--create-config', action='store_true', help='Create sample configuration files')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
-    parser.add_argument('--fix-stats', action='store_true', help='Recalculate statistics from database')
+    parser.add_argument('--show-site-status', action='store_true', help='Show site completion status and exit')
+    parser.add_argument('--reset-site', help='Reset a specific site to reprocess it')
     args = parser.parse_args()
-    
-    if args.fix_stats:
-        init_database()
-        fix_statistics()
-        print_statistics()
-        return
     
     if args.create_config:
         create_sample_config()
@@ -1154,6 +1250,71 @@ def main():
         config['DEBUG_MODE'] = True
         logger.setLevel(logging.DEBUG)
     
+    # Initialize database
+    init_database()
+    
+    # Handle site status display
+    if args.show_site_status:
+        with get_db() as conn:
+            sites = conn.execute('''
+                SELECT site_name, status, total_files, completed_files, failed_files,
+                       datetime(started_at, 'localtime') as started,
+                       datetime(completed_at, 'localtime') as completed
+                FROM sites
+                ORDER BY site_name
+            ''').fetchall()
+            
+            if not sites:
+                print("No sites found in database.")
+            else:
+                print("\nSITE STATUS REPORT")
+                print("="*100)
+                print(f"{'Site Name':<30} {'Status':<20} {'Files':<10} {'Complete':<10} {'Failed':<10} {'Started':<20}")
+                print("-"*100)
+                
+                for site in sites:
+                    status_symbol = {
+                        'completed': '✅',
+                        'completed_with_errors': '⚠️ ',
+                        'processing': '🔄',
+                        'pending': '⏳',
+                        'empty': '📭'
+                    }.get(site['status'], '❓')
+                    
+                    print(f"{site['site_name']:<30} {status_symbol} {site['status']:<17} "
+                          f"{site['total_files']:<10} {site['completed_files']:<10} "
+                          f"{site['failed_files']:<10} {site['started'] or 'N/A':<20}")
+                
+                print("="*100)
+                
+                # Summary
+                summary = conn.execute('''
+                    SELECT 
+                        COUNT(*) as total,
+                        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
+                        SUM(CASE WHEN status = 'completed_with_errors' THEN 1 ELSE 0 END) as with_errors
+                    FROM sites
+                ''').fetchone()
+                
+                print(f"\nSummary: {summary['completed']}/{summary['total']} sites completed successfully, "
+                      f"{summary['with_errors']} completed with errors")
+        return
+    
+    # Handle site reset
+    if args.reset_site:
+        with get_db() as conn:
+            # Delete site record
+            conn.execute('DELETE FROM sites WHERE site_name = ?', (args.reset_site,))
+            # Reset all files for this site to 'discovered'
+            conn.execute('''
+                UPDATE downloads 
+                SET status = 'discovered', attempt_count = 0 
+                WHERE site_name = ? AND status != 'completed'
+            ''', (args.reset_site,))
+            affected = conn.total_changes
+            print(f"Reset site '{args.reset_site}'. {affected} files marked for reprocessing.")
+        return
+    
     logger.info("="*70)
     logger.info("SharePoint Backup Tool - Starting")
     logger.info("="*70)
@@ -1163,9 +1324,6 @@ def main():
     logger.info(f"  Thread Count: {config['NUM_THREADS']}")
     logger.info(f"  Log Level: {config['LOG_LEVEL']}")
     logger.info("="*70)
-    
-    # Initialize database
-    init_database()
     
     # Create new session
     session_id = create_session()
@@ -1192,6 +1350,27 @@ def main():
     if not sites:
         logger.error("No SharePoint sites found in CSV file. Cannot proceed.")
         return
+    
+    # Show site progress overview
+    logger.info("\nChecking site completion status...")
+    with get_db() as conn:
+        for site_info in sites:
+            site_status = conn.execute('''
+                SELECT status, total_files, completed_files, failed_files
+                FROM sites WHERE site_name = ?
+            ''', (site_info['name'],)).fetchone()
+            
+            if site_status:
+                if site_status['status'] == 'completed':
+                    logger.info(f"✅ {site_info['name']}: Complete ({site_status['completed_files']} files)")
+                elif site_status['status'] == 'completed_with_errors':
+                    logger.info(f"⚠️  {site_info['name']}: Complete with {site_status['failed_files']} errors")
+                elif site_status['status'] == 'processing':
+                    logger.info(f"🔄 {site_info['name']}: In progress ({site_status['completed_files']}/{site_status['total_files']} files)")
+                else:
+                    logger.info(f"⏳ {site_info['name']}: Pending")
+            else:
+                logger.info(f"🆕 {site_info['name']}: New site")
     
     # Process each SharePoint site
     success_count = 0
@@ -1239,16 +1418,42 @@ def main():
     logger.info(f"Log file: {log_file}")
     print_statistics()
     
+    # Show final site status
+    logger.info("\nFINAL SITE STATUS:")
+    with get_db() as conn:
+        final_sites = conn.execute('''
+            SELECT site_name, status, total_files, completed_files, failed_files
+            FROM sites
+            ORDER BY 
+                CASE status 
+                    WHEN 'completed' THEN 1
+                    WHEN 'completed_with_errors' THEN 2
+                    WHEN 'processing' THEN 3
+                    ELSE 4
+                END,
+                site_name
+        ''').fetchall()
+        
+        for site in final_sites:
+            if site['status'] == 'completed':
+                logger.info(f"  ✅ {site['site_name']}: {site['completed_files']} files")
+            elif site['status'] == 'completed_with_errors':
+                logger.info(f"  ⚠️  {site['site_name']}: {site['completed_files']} files ({site['failed_files']} failed)")
+            else:
+                logger.info(f"  ❌ {site['site_name']}: {site['completed_files']}/{site['total_files']} files")
+    
     # Backup database one final time
     backup_database()
     
     # Show how to query the database
-    logger.info("\nTo query the database for specific information:")
+    logger.info("\nUseful database queries:")
     logger.info(f"  sqlite3 \"{config['DB_PATH']}\"")
-    logger.info("  Example queries:")
-    logger.info("    SELECT * FROM downloads WHERE status = 'failed';")
-    logger.info("    SELECT site_name, COUNT(*), SUM(file_size_mb) FROM downloads GROUP BY site_name;")
-    logger.info("    SELECT * FROM statistics;")
+    logger.info("  -- Show site completion status:")
+    logger.info("  SELECT * FROM sites;")
+    logger.info("  -- Show failed files by site:")
+    logger.info("  SELECT site_name, COUNT(*) FROM downloads WHERE status='failed' GROUP BY site_name;")
+    logger.info("  -- Reset a site to reprocess:")
+    logger.info("  python sharepoint_backup.py --reset-site 'Site Name'")
 
 if __name__ == "__main__":
     try:

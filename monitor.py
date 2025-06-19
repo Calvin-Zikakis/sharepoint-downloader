@@ -39,7 +39,30 @@ class SharePointBackupMonitor:
         
         stats = {}
         
-        # Get status counts
+        # Get site-level statistics
+        cursor = self.conn.execute('''
+            SELECT 
+                COUNT(*) as total_sites,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_sites,
+                SUM(CASE WHEN status = 'completed_with_errors' THEN 1 ELSE 0 END) as sites_with_errors,
+                SUM(CASE WHEN status = 'processing' THEN 1 ELSE 0 END) as processing_sites,
+                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_sites
+            FROM sites
+        ''')
+        site_summary = cursor.fetchone()
+        stats['site_summary'] = site_summary if site_summary else {}
+        
+        # Get current processing site
+        cursor = self.conn.execute('''
+            SELECT site_name, total_files, completed_files, failed_files
+            FROM sites 
+            WHERE status = 'processing'
+            ORDER BY last_updated DESC
+            LIMIT 1
+        ''')
+        stats['current_site'] = cursor.fetchone()
+        
+        # Get file status counts
         cursor = self.conn.execute('''
             SELECT status, COUNT(*) as count 
             FROM downloads 
@@ -113,6 +136,29 @@ class SharePointBackupMonitor:
         print(f"SharePoint Backup Monitor - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print("=" * 80)
         
+        # Site Progress
+        site_summary = stats.get('site_summary', {})
+        if site_summary.get('total_sites', 0) > 0:
+            print("\n🏢 SITE PROGRESS:")
+            print("-" * 40)
+            print(f"📊 Total sites      : {site_summary.get('total_sites', 0)}")
+            print(f"✅ Completed       : {site_summary.get('completed_sites', 0)}")
+            print(f"⚠️  With errors     : {site_summary.get('sites_with_errors', 0)}")
+            print(f"🔄 Processing      : {site_summary.get('processing_sites', 0)}")
+            print(f"⏳ Pending         : {site_summary.get('pending_sites', 0)}")
+            
+            # Current site being processed
+            current_site = stats.get('current_site')
+            if current_site:
+                site_progress = 0
+                if current_site['total_files'] > 0:
+                    site_progress = (current_site['completed_files'] / current_site['total_files']) * 100
+                
+                print(f"\n📂 Current Site: {current_site['site_name']}")
+                print(f"   Progress: {current_site['completed_files']}/{current_site['total_files']} files ({site_progress:.1f}%)")
+                if current_site['failed_files'] > 0:
+                    print(f"   ❌ Failed: {current_site['failed_files']} files")
+        
         # File Status
         print("\n📊 FILE STATUS:")
         print("-" * 40)
@@ -159,7 +205,7 @@ class SharePointBackupMonitor:
             bar_width = 40
             filled = int((percent / 100) * bar_width)
             bar = '█' * filled + '░' * (bar_width - filled)
-            print(f"\n📊 Progress: [{bar}] {percent:.1f}%")
+            print(f"\n📊 Overall Progress: [{bar}] {percent:.1f}%")
         
         # Current Activity
         print("\n⚡ CURRENT ACTIVITY:")

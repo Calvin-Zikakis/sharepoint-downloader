@@ -6,6 +6,7 @@ A robust Python tool for backing up / downloading SharePoint Online sites to loc
 
 - 📁 **Bulk Download**: Download entire SharePoint sites and document libraries
 - 🔄 **Resume Capability**: Automatically resume interrupted downloads using SQLite tracking
+- ✅ **Site-level Tracking**: Marks sites as complete to avoid reprocessing
 - 📊 **Progress Tracking**: Real-time progress monitoring with detailed statistics
 - 🔐 **Secure Authentication**: Uses Azure AD app registration with client credentials
 - 🧵 **Multi-threaded**: Concurrent downloads for improved performance
@@ -121,6 +122,33 @@ python sharepoint_backup.py --config /path/to/config.ini
 python sharepoint_backup.py --debug
 ```
 
+### Site Management
+
+```bash
+# Show site completion status
+python sharepoint_backup.py --show-site-status
+
+# Reset a specific site to reprocess
+python sharepoint_backup.py --reset-site "Marketing Team"
+```
+
+## Site-Level Tracking
+
+The tool now tracks completion at the site level:
+
+- **Completed Sites**: Automatically skipped on subsequent runs
+- **Sites with Errors**: Only failed files are retried
+- **Smart Resume**: After interruption, resumes exactly where it left off
+- **Site Status**: View which sites are complete, partial, or pending
+
+### Site Statuses
+
+- ✅ **completed**: All files downloaded successfully
+- ⚠️ **completed_with_errors**: Site processed but some files failed
+- 🔄 **processing**: Currently being processed
+- ⏳ **pending**: Queued for processing
+- 📭 **empty**: No document libraries found
+
 ## Monitoring Progress
 
 ### Real-time Monitoring (PowerShell)
@@ -140,8 +168,15 @@ while($true) {
 -- Check overall progress
 SELECT status, COUNT(*) as count FROM downloads GROUP BY status;
 
--- See failed files
-SELECT file_path, error_message FROM downloads WHERE status='failed';
+-- View site completion status
+SELECT site_name, status, total_files, completed_files, failed_files 
+FROM sites ORDER BY site_name;
+
+-- See failed files by site
+SELECT site_name, COUNT(*) as failed_count 
+FROM downloads 
+WHERE status='failed' 
+GROUP BY site_name;
 
 -- Check size by site
 SELECT site_name, 
@@ -149,6 +184,11 @@ SELECT site_name,
        ROUND(SUM(file_size_mb), 2) as total_mb
 FROM downloads 
 GROUP BY site_name;
+
+-- Find incomplete sites
+SELECT site_name, status, total_files - completed_files as remaining 
+FROM sites 
+WHERE status != 'completed';
 
 -- Current session statistics
 SELECT * FROM statistics;
@@ -195,6 +235,16 @@ The script handles rate limiting automatically, but you can adjust:
 - Increase `API_RETRY_DELAY`
 
 ## Database Schema
+
+### sites table
+- `site_name`: SharePoint site name
+- `site_url`: Original SharePoint URL
+- `status`: pending/processing/completed/completed_with_errors
+- `total_files`: Total files found in site
+- `completed_files`: Successfully downloaded files
+- `failed_files`: Failed download count
+- `started_at`: When processing started
+- `completed_at`: When site was completed
 
 ### downloads table
 - `file_path`: Local destination path
