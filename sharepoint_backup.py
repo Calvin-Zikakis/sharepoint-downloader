@@ -8,6 +8,7 @@ License: MIT
 """
 
 import os
+os.environ['PYTHONIOENCODING'] = 'utf-8'
 import sys
 import csv
 import logging
@@ -25,6 +26,7 @@ import shutil
 from urllib.parse import urlparse
 from collections import deque
 from contextlib import contextmanager
+import codecs
 
 # Try to load configuration from environment or config file
 CONFIG_FILE = os.environ.get('SHAREPOINT_BACKUP_CONFIG', 'config.ini')
@@ -55,17 +57,42 @@ DEFAULT_CONFIG = {
 
 # Load configuration from file if it exists
 config = DEFAULT_CONFIG.copy()
+config_loaded = False
+
 if os.path.exists(CONFIG_FILE):
     cfg_parser = configparser.ConfigParser()
     cfg_parser.read(CONFIG_FILE)
     if 'sharepoint_backup' in cfg_parser:
-        config.update(dict(cfg_parser['sharepoint_backup']))
-        # Convert string numbers to int
-        for key in ['NUM_THREADS', 'MAX_RETRY', 'BATCH_SIZE', 'MAX_FILES_PER_SESSION', 
-                    'API_RETRY_DELAY', 'TOKEN_REFRESH_INTERVAL', 'PROGRESS_SAVE_INTERVAL', 
-                    'DB_BACKUP_INTERVAL']:
+        # Update config with values from file
+        for key, value in cfg_parser['sharepoint_backup'].items():
+            # Convert key to uppercase to match our config keys
+            key_upper = key.upper()
+            if key_upper in config:
+                config[key_upper] = value
+        
+        # Remove quotes from string values if present
+        for key, value in config.items():
+            if isinstance(value, str):
+                if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+                    config[key] = value[1:-1]
+        
+        # Convert string numbers back to int for numeric config values
+        numeric_keys = ['NUM_THREADS', 'MAX_RETRY', 'BATCH_SIZE', 'MAX_FILES_PER_SESSION', 
+                       'API_RETRY_DELAY', 'TOKEN_REFRESH_INTERVAL', 'PROGRESS_SAVE_INTERVAL', 
+                       'DB_BACKUP_INTERVAL']
+        for key in numeric_keys:
             if key in config and isinstance(config[key], str):
-                config[key] = int(config[key])
+                try:
+                    config[key] = int(config[key])
+                except ValueError:
+                    # Can't log yet, will report later
+                    config[key] = DEFAULT_CONFIG[key]
+        
+        # Convert boolean values
+        if 'DEBUG_MODE' in config and isinstance(config['DEBUG_MODE'], str):
+            config['DEBUG_MODE'] = config['DEBUG_MODE'].lower() in ('true', 'yes', '1', 'on')
+        
+        config_loaded = True
 
 # For handling O365 authentication and SharePoint operations
 try:
@@ -91,7 +118,7 @@ except ImportError:
 for dir_path in [config['LOG_DIR'], os.path.dirname(config['DB_PATH']), config['OUTPUT_DIR']]:
     os.makedirs(dir_path, exist_ok=True)
 
-# Setup logging
+# Setup logging with UTF-8 encoding
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 log_file = os.path.join(config['LOG_DIR'], f"sharepoint_backup_{timestamp}.log")
 
@@ -100,15 +127,36 @@ log_level = getattr(logging, config['LOG_LEVEL'].upper(), logging.INFO)
 if config['DEBUG_MODE']:
     log_level = logging.DEBUG
 
+# Create UTF-8 compatible stream handler
+if sys.stdout.encoding != 'utf-8':
+    # Wrap stdout with UTF-8 encoding
+    stdout_handler = logging.StreamHandler(
+        codecs.getwriter('utf-8')(sys.stdout.buffer)
+    )
+else:
+    stdout_handler = logging.StreamHandler()
+
 logging.basicConfig(
     level=log_level,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(log_file),
-        logging.StreamHandler()
+        logging.FileHandler(log_file, encoding='utf-8'),
+        stdout_handler
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Add this debug output right after the logger is configured
+if config_loaded:
+    logger.info(f"Configuration loaded from {CONFIG_FILE}")
+else:
+    if os.path.exists(CONFIG_FILE):
+        logger.warning(f"Section 'sharepoint_backup' not found in {CONFIG_FILE}")
+    else:
+        logger.warning(f"Configuration file {CONFIG_FILE} not found at: {os.path.abspath(CONFIG_FILE)}")
+
+logger.info(f"Looking for config file at: {os.path.abspath(CONFIG_FILE)}")
+logger.info(f"Config file exists: {os.path.exists(CONFIG_FILE)}")
 
 # Dedicated logger for failed file downloads
 failed_files_log_name = f"sharepoint_backup_failed_files_{timestamp}.log"
@@ -122,6 +170,7 @@ fh_failed.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(messag
 
 failed_files_logger.addHandler(fh_failed)
 failed_files_logger.propagate = False
+
 
 # Progress tracking globals
 file_counter = 0

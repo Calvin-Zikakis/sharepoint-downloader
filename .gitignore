@@ -58,3 +58,4 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+sharepoint_sites copy.csv
